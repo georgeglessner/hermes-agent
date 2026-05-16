@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.github_token }}
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,23 +37,10 @@ jobs:
         working-directory: ./web
         run: npm run build
 
-      - name: Check web_dist exists
-        run: |
-          echo "Checking hermes_cli/web_dist..."
-          ls -la hermes_cli/web_dist/ 2>/dev/null || echo "Directory not found!"
-          ls -la hermes_cli/web_dist/.vite/manifest.json 2>/dev/null || echo "Manifest not found!"
-
-      - name: Configure Git
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Commit and push
-        run: |
-          git add hermes_cli/web_dist/
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore: rebuild web_dist [skip ci]"
-            git push https://${{ github.token }}@github.com/${{ github.repository }}.git HEAD:main
-          fi
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: rebuild web_dist [skip ci]"
+          file_pattern: "hermes_cli/web_dist/**"
+          skip_fetch: true
+          skip_checkout: true
