@@ -8,12 +8,19 @@ on:
       - '.github/workflows/build-web-dist.yml'
   workflow_dispatch:
 
+# Add permissions for the workflow
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -30,26 +37,25 @@ jobs:
         working-directory: ./web
         run: npm run build
 
-      - name: Check if web_dist changed
-        id: check
-        run: |
-          if [ -d "hermes_cli/web_dist" ]; then
-            # Check if the new build differs from current
-            echo "web_dist exists, checking for changes..."
-          fi
-          
       - name: Commit and push web_dist
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
+          # List what was built
+          echo "Contents of hermes_cli/web_dist:"
+          ls -la hermes_cli/web_dist/
+          
           # Stage the built web_dist
           git add hermes_cli/web_dist/
           
           # Check if there are changes to commit
-          if git diff --cached --quiet; then
+          if git diff --staged --quiet; then
             echo "No changes to web_dist"
           else
+            echo "Changes detected, committing..."
             git commit -m "chore: rebuild web_dist [skip ci]"
-            git push
+            git push origin HEAD:main
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
