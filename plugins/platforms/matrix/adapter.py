@@ -775,6 +775,7 @@ class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
     supports_code_blocks = True  # Matrix renders fenced code blocks (HTML/markdown)
+    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
     # Matrix clients commonly reserve typed "/" for client-local commands;
     # the adapter accepts "!command" as the alias that always reaches Hermes
@@ -808,6 +809,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._sync_task: Optional[asyncio.Task] = None
+        self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
         self._startup_ts: float = 0.0
         # Clock-skew detection: count grace-check drops that happen well
@@ -1134,7 +1136,7 @@ class MatrixAdapter(BasePlatformAdapter):
     # Required overrides
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
         from mautrix.api import HTTPAPI
         from mautrix.client import Client
@@ -1446,7 +1448,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     await self._dispatch_sync(sync_data)
                 except Exception as exc:
                     logger.warning("Matrix: initial sync event dispatch error: %s", exc)
-                await self._join_pending_invites(sync_data)
+                self._schedule_pending_invite_joins(sync_data)
             else:
                 logger.warning(
                     "Matrix: initial sync returned unexpected type %s",
@@ -1477,6 +1479,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._sync_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        invite_join_tasks = list(self._invite_join_tasks.values())
+        for task in invite_join_tasks:
+            if not task.done():
+                task.cancel()
+        if invite_join_tasks:
+            await asyncio.gather(*invite_join_tasks, return_exceptions=True)
+        self._invite_join_tasks.clear()
 
         redaction_tasks = list(self._reaction_redaction_tasks)
         for task in redaction_tasks:
@@ -2216,7 +2226,10 @@ class MatrixAdapter(BasePlatformAdapter):
                         await self._dispatch_sync(sync_data)
                     except Exception as exc:
                         logger.warning("Matrix: sync event dispatch error: %s", exc)
-                    await self._join_pending_invites(sync_data)
+                    self._schedule_pending_invite_joins(sync_data)
+                    # Let freshly scheduled invite joins start before the next
+                    # sync iteration without waiting for slow or stuck joins.
+                    await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 return
@@ -2880,7 +2893,7 @@ class MatrixAdapter(BasePlatformAdapter):
             "Matrix: invited to %s — joining",
             room_id,
         )
-        await self._join_room_by_id(room_id)
+        self._schedule_invite_join(room_id)
 
     async def _join_room_by_id(self, room_id: str) -> bool:
         """Join a room by ID and refresh local caches on success."""
@@ -2900,7 +2913,25 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.warning("Matrix: error joining %s: %s", room_id, exc)
             return False
 
-    async def _join_pending_invites(self, sync_data: Dict[str, Any]) -> None:
+    def _schedule_invite_join(self, room_id: str) -> None:
+        """Schedule an invite join without blocking sync or gateway readiness."""
+        if not room_id or room_id in self._joined_rooms:
+            return
+        existing = self._invite_join_tasks.get(room_id)
+        if existing and not existing.done():
+            return
+
+        async def _join_invite() -> None:
+            try:
+                await asyncio.wait_for(self._join_room_by_id(room_id), timeout=45.0)
+            except asyncio.TimeoutError:
+                logger.warning("Matrix: timed out joining invite %s", room_id)
+            finally:
+                self._invite_join_tasks.pop(room_id, None)
+
+        self._invite_join_tasks[room_id] = asyncio.create_task(_join_invite())
+
+    def _schedule_pending_invite_joins(self, sync_data: Dict[str, Any]) -> None:
         """Join rooms still present in rooms.invite after sync processing."""
         rooms = sync_data.get("rooms", {}) if isinstance(sync_data, dict) else {}
         invites = rooms.get("invite", {})
@@ -2910,7 +2941,7 @@ class MatrixAdapter(BasePlatformAdapter):
             if room_id in self._joined_rooms:
                 continue
             logger.info("Matrix: reconciling pending invite for %s", room_id)
-            await self._join_room_by_id(str(room_id))
+            self._schedule_invite_join(str(room_id))
 
     # ------------------------------------------------------------------
     # Reactions (send, receive, processing lifecycle)
@@ -3572,21 +3603,29 @@ class MatrixAdapter(BasePlatformAdapter):
         return None
 
     async def _get_room_member_count(self, room_id: str) -> Optional[int]:
+        # Tier 1: state_store (fast, cache-backed).
         state_store = (
             getattr(self._client, "state_store", None) if self._client else None
         )
-        if not state_store:
-            return None
-        try:
-            members = await state_store.get_members(room_id)
-        except Exception:
-            return None
-        if members is None:
-            return None
-        try:
-            return len(members)
-        except TypeError:
-            return None
+        if state_store:
+            try:
+                members = await state_store.get_members(room_id)
+                if members is not None:
+                    return len(members)
+            except Exception:
+                pass
+
+        # Tier 2: API fallback (direct server query) when the cache is empty.
+        client = getattr(self, "_client", None)
+        if client is not None and hasattr(client, "joined_members"):
+            try:
+                resp = await client.joined_members(room_id)
+                if getattr(resp, "members", None) is not None:
+                    return len(resp.members)
+            except Exception:
+                pass
+
+        return None
 
     async def _get_room_name(self, room_id: str) -> Optional[str]:
         if not self._client or not hasattr(self._client, "get_state_event"):
@@ -3673,8 +3712,23 @@ class MatrixAdapter(BasePlatformAdapter):
         member_count = await self._get_room_member_count(room_id)
         has_explicit_name = bool(room_name)
         is_direct = bool(self._dm_rooms.get(room_id, False))
-        conflict = bool(is_direct and has_explicit_name)
-        chat_type = "dm" if is_direct and not has_explicit_name else "room"
+        # member_count is the primary DM signal: <=2 members means this is
+        # necessarily a 1:1 conversation (or self-DM), regardless of m.direct
+        # or room name. Most Matrix clients auto-name DM rooms (e.g.
+        # "Alice & Bot"), so the old `not has_explicit_name` check
+        # misclassified virtually all client-created DMs as rooms. Falls back
+        # to the m.direct + name heuristic when the count is unavailable (e.g.
+        # state_store and API query both fail). A room that grew to 3+ members
+        # but is still in stale m.direct is correctly classified as a room.
+        is_likely_dm = (member_count is not None and member_count <= 2) or (
+            is_direct and not has_explicit_name
+        )
+        conflict = bool(
+            is_direct
+            and has_explicit_name
+            and (member_count is None or member_count > 2)
+        )
+        chat_type = "dm" if is_likely_dm else "room"
         display_name = room_name or canonical_alias or room_id
 
         identity = MatrixRoomIdentity(
