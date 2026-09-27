@@ -13,6 +13,7 @@ import { type FC, type ReactNode, useCallback, useContext, useEffect, useMemo, u
 import { useInRouterContext, useNavigate } from 'react-router'
 
 import { requestModelMenuToggle } from '@/app/chat/composer/focus'
+import { useComposerScope } from '@/app/chat/composer/scope'
 import { useSessionView } from '@/app/chat/session-view'
 import { SETTINGS_ROUTE } from '@/app/routes'
 import { dispatchedTo } from '@/components/assistant-ui/thread/agent-delivery'
@@ -94,6 +95,13 @@ interface MessageActionProps {
    *  streaming delta flush (the text changes ~30×/s), which profiling showed
    *  was a large slice of per-token script time on long transcripts. */
   getMessageText: () => string
+  /** Lazy accessor for the whole response group's blank-line-joined text — the
+   *  explicit full-response copy/read-aloud scope (#118864). Identical to
+   *  `getMessageText` on a solo reply. */
+  getFullResponseText: () => string
+  /** True when the response group carries more than one text-bearing reply, so
+   *  the current-reply and full-response scopes actually differ. */
+  fullResponseAvailable: boolean
   onBranchInNewChat?: (messageId: string) => void
 }
 
@@ -244,7 +252,16 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
   // stable across the 30 Hz delta stream, so this adds no per-token renders).
   const turnDurationS = useAuiState(s => s.message.metadata?.custom?.durationS as number | undefined)
 
-  const getMessageText = useCallback(
+  // Response-scope text accessors (#118864). The DEFAULT copy/read-aloud reads
+  // only THIS message's text: joining the whole response group mixed sealed
+  // interim narration and mid-turn commentary into the final reply's clipboard
+  // and speech. The whole-turn semantic survives as an explicit second scope
+  // (Copy full response / Shift-click Read aloud) — the live-view counterpart
+  // of the rehydrated single bubble for the background-continuation grouping
+  // 3bdd4cc5fd delivered.
+  const getMessageText = useCallback(() => messageContentText(messageRuntime.getState().content), [messageRuntime])
+
+  const getFullResponseText = useCallback(
     () =>
       responseIds.length
         ? responseIds
@@ -254,6 +271,8 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
         : messageContentText(messageRuntime.getState().content),
     [messageRuntime, responseIds, threadRuntime]
   )
+
+  const fullResponseAvailable = responseIds.length > 1
 
   // useEnterAnimation consults `enabled` ONLY when its callback ref fires,
   // i.e. at mount: the hook parks the value in a ref and returns a
@@ -320,14 +339,23 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
             </MessagePrimitive.Error>
           </div>
           <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" suppressIfDuplicatePart />
-          {hasVisibleText && !isInterim && responseTail && (
-            <AssistantFooter
-              durationS={turnDurationS}
-              getMessageText={getMessageText}
-              messageId={messageId}
-              onBranchInNewChat={onBranchInNewChat}
-            />
-          )}
+          {/* Sealed interims skip the footer so a tool-heavy turn doesn't grow a
+              copy bar per paragraph (72dd01c553) — EXCEPT when the interim is the
+              group's last text-bearing row (the turn ended on a tool-only bubble):
+              without the bar that turn has no copy/branch affordance at all
+              (#118864). */}
+          {hasVisibleText &&
+            responseTail &&
+            (!isInterim || (responseIds.length > 0 && responseIds.at(-1) === messageId)) && (
+              <AssistantFooter
+                durationS={turnDurationS}
+                fullResponseAvailable={fullResponseAvailable}
+                getFullResponseText={getFullResponseText}
+                getMessageText={getMessageText}
+                messageId={messageId}
+                onBranchInNewChat={onBranchInNewChat}
+              />
+            )}
           {/* Last thing in the turn — under the action bar, the way Cursor ends a
           turn on its summary rather than burying it above the controls. */}
           <SettledChangedFiles />
@@ -426,7 +454,7 @@ const AssistantPreviewEmbeds: FC = () => {
   return (
     <div className="mt-3 flex flex-wrap gap-2">
       {previewTargets.map(target => (
-        <PreviewAttachment key={target} source="explicit-link" target={target} />
+        <PreviewAttachment key={target} target={target} />
       ))}
     </div>
   )
@@ -709,6 +737,7 @@ const ScheduledRetryAction: FC<{ resetsAt: number }> = ({ resetsAt }) => {
       },
       Math.max(0, fireAt - Date.now())
     )
+
     const tick = window.setInterval(() => setNow(Date.now()), 1000)
 
     return () => {
@@ -936,6 +965,8 @@ const ErrorRecoveryActions: FC = () => {
 
 const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
   durationS,
+  fullResponseAvailable,
+  getFullResponseText,
   messageId,
   getMessageText,
   onBranchInNewChat
@@ -990,7 +1021,20 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
           </TooltipIconButton>
         )}
         <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
-        <ReadAloudButton getText={getMessageText} messageId={messageId} />
+        {fullResponseAvailable && (
+          <CopyButton
+            appearance="icon"
+            buttonSize="icon"
+            label={copy.copyFullResponse}
+            text={getFullResponseText}
+          />
+        )}
+        <ReadAloudButton
+          fullResponseAvailable={fullResponseAvailable}
+          getFullText={getFullResponseText}
+          getText={getMessageText}
+          messageId={messageId}
+        />
         <ActionBarPrimitive.Reload asChild>
           <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
             <RefreshCwIcon className="size-3.5" />
@@ -1037,12 +1081,19 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
   )
 }
 
-const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ getText, messageId }) => {
+const ReadAloudButton: FC<{
+  fullResponseAvailable: boolean
+  getFullText: () => string
+  getText: () => string
+  messageId: string
+}> = ({ fullResponseAvailable, getFullText, getText, messageId }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const voicePlayback = useStore($voicePlayback)
   const view = useSessionView()
   const sessionId = useStore(view.$runtimeId)
+  // A Bot chat's session owns its own (connection, profile) → its own TTS voice.
+  const { connectionId, profile } = useComposerScope()
 
   const readAloudStatus =
     voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
@@ -1051,29 +1102,41 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
   const isSpeaking = readAloudStatus === 'speaking'
   const anyPlaybackActive = voicePlayback.status !== 'idle'
   const Icon = isPreparing ? Loader2Icon : isSpeaking ? VolumeXIcon : AudioLines
-  const tooltip = isPreparing ? copy.preparingAudio : isSpeaking ? copy.stopReading : copy.readAloud
 
-  const read = useCallback(async () => {
-    const text = getText()
+  const tooltip = isPreparing
+    ? copy.preparingAudio
+    : isSpeaking
+      ? copy.stopReading
+      : fullResponseAvailable
+        ? `${copy.readAloud} (${copy.readAloudFullResponseHint})`
+        : copy.readAloud
 
-    if (!text || $voicePlayback.get().status !== 'idle') {
-      return
-    }
+  // Default reads the current reply only; Shift-click reads the whole response
+  // group — the read-aloud mirror of the two copy scopes (#118864).
+  const read = useCallback(
+    async (full: boolean) => {
+      const text = full ? getFullText() : getText()
 
-    try {
-      await playSpeechText(text, { messageId, source: 'read-aloud' })
-      markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
-    } catch (error) {
-      notifyError(error, copy.readAloudFailed)
-    }
-  }, [copy.readAloudFailed, getText, messageId, sessionId, view.$messages])
+      if (!text || $voicePlayback.get().status !== 'idle') {
+        return
+      }
+
+      try {
+        await playSpeechText(text, { connectionId, messageId, profile, source: 'read-aloud' })
+        markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
+      } catch (error) {
+        notifyError(error, copy.readAloudFailed)
+      }
+    },
+    [connectionId, copy.readAloudFailed, getFullText, getText, messageId, profile, sessionId, view.$messages]
+  )
 
   return (
     <TooltipIconButton
       disabled={isPreparing || (!isSpeaking && anyPlaybackActive)}
-      onClick={() => {
+      onClick={event => {
         triggerHaptic('selection')
-        void (isSpeaking ? stopVoicePlayback() : read())
+        void (isSpeaking ? stopVoicePlayback() : read(event.shiftKey))
       }}
       tooltip={tooltip}
     >
